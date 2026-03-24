@@ -1,10 +1,6 @@
 """
 ===============================================================================
 CreateVideos.py — Suite2p Calcium Imaging Video Generator
-===============================================================================
-
-Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
-Script Author : Jasmine S. Yeo
 Created : 2026-03-24
 Last Modified : 2026-03-24
 

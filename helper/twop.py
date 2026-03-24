@@ -1,10 +1,6 @@
 """
 ===============================================================================
 twop.py — Two-Photon Imaging Data Loader and dF/F Calculator
-===============================================================================
-
-Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
-Script Author : Jasmine S. Yeo
 Created : 2026-03-24
 Last Modified : 2026-03-24
 

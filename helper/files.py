@@ -1,10 +1,6 @@
 """
 ===============================================================================
 files.py — File I/O Utilities for PrairieView XML and HDF5 Data
-===============================================================================
-
-Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
-Script Author : Jasmine S. Yeo
 Created : 2026-03-24
 Last Modified : 2026-03-24
 

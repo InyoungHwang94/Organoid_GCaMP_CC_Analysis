@@ -1,10 +1,6 @@
 """
 ===============================================================================
 CalculateCC.py — Correlation Coefficient Analysis of Organoid Calcium Imaging
-===============================================================================
-
-Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
-Script Author : Jasmine S. Yeo
 Created : 2026-03-24
 Last Modified : 2026-03-24
 

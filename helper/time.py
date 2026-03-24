@@ -1,10 +1,6 @@
 """
 ===============================================================================
 time.py — Datetime Conversion Utilities for HDF5 Storage
-===============================================================================
-
-Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
-Script Author : Jasmine S. Yeo
 Created : 2026-03-24
 Last Modified : 2026-03-24
 

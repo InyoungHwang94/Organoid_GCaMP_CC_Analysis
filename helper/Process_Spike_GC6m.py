@@ -1,10 +1,6 @@
 """
 ===============================================================================
 Process_Spike_GC6m.py — OASIS Spike Deconvolution Optimized for GCaMP6m
-===============================================================================
-
-Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
-Script Author : Jasmine S. Yeo
 Created : 2026-03-24
 Last Modified : 2026-03-24
 
