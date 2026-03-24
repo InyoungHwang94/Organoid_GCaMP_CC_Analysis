@@ -1,8 +1,31 @@
 """
-Gabazine Comparison Analysis - Enhanced for Multiple Post Recordings
-Handles both single post and multiple post-gabazine recordings
+===============================================================================
+GabazineComparison.py — Pre/Post Gabazine Neural Activity Comparison
+===============================================================================
 
-JSY, 01/2026
+Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
+Script Author : Jasmine S. Yeo
+Created : 2026-03-24
+Last Modified : 2026-03-24
+
+Purpose
+-------
+Computes and compares pairwise correlation coefficients before and after
+Gabazine (GABA-A antagonist) application, supporting both single and
+multiple post-treatment recording epochs.
+
+Pipeline Position
+-----------------
+Runs after  : CalculateCC.py
+Runs before : (downstream statistical analysis / figure generation)
+
+Notes
+-----
+- Set base_folder to the directory containing pre/post recording subfolders.
+- PRE recording: folder name contains no '_GZ_' tag.
+- POST recordings: folder names contain '_GZ_001', '_GZ_002', etc.
+
+===============================================================================
 """
 
 import sys

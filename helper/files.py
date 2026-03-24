@@ -1,3 +1,26 @@
+"""
+===============================================================================
+files.py — File I/O Utilities for PrairieView XML and HDF5 Data
+===============================================================================
+
+Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
+Script Author : Jasmine S. Yeo
+Created : 2026-03-24
+Last Modified : 2026-03-24
+
+Purpose
+-------
+Reads PrairieView XML acquisition metadata and reads/writes nested
+dictionaries to HDF5 format for all analysis scripts.
+
+Notes
+-----
+- Nested dicts and lists are recursively saved/loaded from HDF5 groups.
+- datetime objects are converted to ISO strings before HDF5 storage.
+
+===============================================================================
+"""
+
 import xml.etree.ElementTree as ET
 import datetime
 import numpy as np

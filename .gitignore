@@ -1,4 +1,24 @@
+# Video files
 *.mp4
+
+# Python
+*.pyc
+__pycache__/
+.ipynb_checkpoints/
+
+# Data files
+*.h5
+*.npy
+*.bin
+*.tif
+*.tiff
+
+# Suite2p output
+suite2p/
+
+# IDE
 *.code-workspace
-*.pyc
-*.pyc
+
+# OS
+.DS_Store
+Thumbs.db

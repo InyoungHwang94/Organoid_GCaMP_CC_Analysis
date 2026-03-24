@@ -1,8 +1,30 @@
 """
-Process_Spike_GC6m.py 
-This script processes spike data specifically for GCaMP6m kinetics
+===============================================================================
+Process_Spike_GC6m.py — OASIS Spike Deconvolution Optimized for GCaMP6m
+===============================================================================
 
-JSY, 08/28/2025
+Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
+Script Author : Jasmine S. Yeo
+Created : 2026-03-24
+Last Modified : 2026-03-24
+
+Purpose
+-------
+Performs OASIS AR1 spike deconvolution on dF/F traces with parameters tuned
+for GCaMP6m (tau = 245 ms); falls back to the expected time constant if
+per-cell estimation falls outside a physiologically plausible range.
+
+Pipeline Position
+-----------------
+Runs after  : twop.py (dF/F calculation)
+Runs before : CalculateCC.py, GabazineComparison.py, MultiDrug_Comparison.py
+
+Notes
+-----
+- Cells with zero variance, all-NaN, or all-zero traces are skipped.
+- debug_level: 'none', 'summary' (default), or 'detailed'.
+
+===============================================================================
 """
 
 import numpy as np

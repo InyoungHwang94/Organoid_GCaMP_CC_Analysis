@@ -1,3 +1,25 @@
+"""
+===============================================================================
+time.py — Datetime Conversion Utilities for HDF5 Storage
+===============================================================================
+
+Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
+Script Author : Jasmine S. Yeo
+Created : 2026-03-24
+Last Modified : 2026-03-24
+
+Purpose
+-------
+Converts Python datetime objects to floats (seconds) or ISO-format strings
+for storage in HDF5 files via files.py.
+
+Notes
+-----
+- time2str uses the format '%Y-%m-%d-%H-%M-%S-%f' for HDF5 compatibility.
+
+===============================================================================
+"""
+
 import numpy as np
 import datetime
 

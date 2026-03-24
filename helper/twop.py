@@ -1,8 +1,30 @@
 """
-helper/twop.py
-Two-photon imaging data analysis class
+===============================================================================
+twop.py — Two-Photon Imaging Data Loader and dF/F Calculator
+===============================================================================
 
-DMM, 2024
+Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
+Script Author : Jasmine S. Yeo
+Created : 2026-03-24
+Last Modified : 2026-03-24
+
+Purpose
+-------
+Defines the TwoP class for loading Suite2p output files and computing
+neuropil-corrected dF/F traces and OASIS-based spike deconvolution.
+
+Pipeline Position
+-----------------
+Runs after  : Suite2p segmentation
+Runs before : CalculateCC.py, GabazineComparison.py, MultiDrug_Comparison.py
+
+Notes
+-----
+- Neuropil correction coefficient is 0.7 (standard Suite2p default).
+- Baseline F0 is estimated as the 8th percentile of raw fluorescence.
+- Originally authored by DMM (2024); adapted by JSY.
+
+===============================================================================
 """
 
 import os
@@ -44,13 +66,6 @@ class TwoP():
 
     def find_files(self):
 
-        # self.F = np.load(os.path.join(self.recording_path, r'plane0\F.npy'), allow_pickle=True)
-        # self.Fneu = np.load(os.path.join(self.recording_path, r'plane0\Fneu.npy'), allow_pickle=True)
-        # iscell = np.load(os.path.join(self.recording_path, r'plane0\iscell.npy'), allow_pickle=True)
-        # self.stat = np.load(os.path.join(self.recording_path, r'plane0\stat.npy'), allow_pickle=True)
-        # self.ops = np.load(os.path.join(self.recording_path, r'plane0\ops.npy'), allow_pickle=True).item()
-        # spks = np.load(os.path.join(self.recording_path, r'plane0\spks.npy'), allow_pickle=True)
-        
         self.F = np.load(os.path.join(self.recording_path, r'suite2p\plane0\F.npy'), allow_pickle=True)
         self.Fneu = np.load(os.path.join(self.recording_path, r'suite2p\plane0\Fneu.npy'), allow_pickle=True)
         iscell = np.load(os.path.join(self.recording_path, r'suite2p\plane0\iscell.npy'), allow_pickle=True)

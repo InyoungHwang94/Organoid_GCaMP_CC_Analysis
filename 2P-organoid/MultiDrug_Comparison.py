@@ -1,9 +1,29 @@
 """
-Multi-Drug Condition Analysis for Organoid Imaging
-Analyzes organoids across multiple drug conditions in sequence:
-Pre → Gabazine → GZ_washed → AP5 → AP5_washed → CNQX → TTX
+===============================================================================
+MultiDrug_Comparison.py — Sequential Multi-Drug Neural Activity Analysis
+===============================================================================
 
-JSY, 01/2026
+Authors : Inyoung Hwang (project lead), Jasmine S. Yeo (analysis)
+Script Author : Jasmine S. Yeo
+Created : 2026-03-24
+Last Modified : 2026-03-24
+
+Purpose
+-------
+Tracks pairwise correlation coefficients across a sequential pharmacological
+dissection: Pre → Gabazine → GZ_washed → AP5 → AP5_washed → CNQX → TTX.
+
+Pipeline Position
+-----------------
+Runs after  : CalculateCC.py
+Runs before : (downstream statistical analysis / figure generation)
+
+Notes
+-----
+- Set base_folder to the directory containing condition subfolders.
+- Recording order is inferred from the folder name number (e.g., 'org4_2.GZ-001').
+
+===============================================================================
 """
 
 import sys
@@ -38,8 +58,6 @@ def sort_key_drug_condition(folder_name):
     
     Falls back to keyword-based sorting if number pattern not found.
     """
-    import re
-    
     # Try to extract the number after 'org' and before the dot
     # Pattern: org{digits}_{NUMBER}.{anything}
     match = re.search(r'org\d+_(\d+)\.', folder_name)
@@ -70,8 +88,6 @@ def Frame_Detector_Per_Lap_MultiDrug(base_folder):
     Detect and sort recording folders in the correct drug condition order.
     Reads XML files from each recording folder to determine frame counts.
     """
-    import re
-    
     print(f"\n{'='*70}")
     print("AUTO-SPLIT: Multi-Drug Condition Order")
     print(f"{'='*70}")
@@ -240,8 +256,6 @@ def Frame_Detector_Per_Lap_MultiDrug_EqualSplit(base_folder):
     
     ⚠️  WARNING: This assumes all recordings have equal length!
     """
-    import re
-    
     print(f"\n{'='*70}")
     print("FALLBACK: Equal Frame Division (No XML)")
     print(f"{'='*70}")
