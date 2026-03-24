@@ -11,6 +11,7 @@ This repository contains the two-photon calcium imaging analysis pipeline used t
 
 - **Jasmine S. Yeo** — Data analysis and visualization
   Department of Molecular, Cellular, and Developmental Biology, University of California Santa Barbara, Santa Barbara, CA, USA 93106
+  jasmineyeo@ucsb.edu
 
 ## Dataset Description
 Two-photon calcium imaging was performed on cortical organoids expressing GCaMP6m. Imaging was carried out on a PrairieView microscope at ~10–15 Hz frame rate. Cell segmentation and fluorescence extraction were performed with Suite2p prior to this analysis.
