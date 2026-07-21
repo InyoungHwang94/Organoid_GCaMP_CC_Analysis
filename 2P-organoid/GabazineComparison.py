@@ -2,13 +2,17 @@
 ===============================================================================
 GabazineComparison.py — Pre/Post Gabazine Neural Activity Comparison
 Created : 2026-03-24
-Last Modified : 2026-03-24
+Last Modified : 2026-07-20
 
 Purpose
 -------
 Computes and compares pairwise correlation coefficients before and after
 Gabazine (GABA-A antagonist) application, supporting both single and
-multiple post-treatment recording epochs.
+multiple post-treatment recording epochs. Cross-correlation is vectorized
+and paired with a shuffled chance-level baseline; per-recording results
+(PRE and POST) are cached so each unique recording within an organoid is
+loaded, filtered, correlated, and shuffled only once, no matter how many
+PRE x POST pairings reuse it
 
 Pipeline Position
 -----------------
@@ -17,9 +21,22 @@ Runs before : (downstream statistical analysis / figure generation)
 
 Notes
 -----
-- Set base_folder to the directory containing pre/post recording subfolders.
+- Set BASE_FOLDERS (list) to the base directories containing organoid
+  subfolders; each is run through run_full_pipeline() in turn.
 - PRE recording: folder name contains no '_GZ_' tag.
 - POST recordings: folder names contain '_GZ_001', '_GZ_002', etc.
+- calculate_cross_correlation_with_lags() is vectorized (matrix ops across
+  all lags/cells at once) instead of the original per-pair loop.
+- calculate_shuffled_cross_correlation_baseline() estimates a chance-level
+  correlation via independent circular shifts (N_SHUFFLES, default 1000).
+- get_pre_recording_data() / get_post_recording_data() cache filtering +
+  correlation + shuffle results per recording path, shared across TYPE 1
+  pairwise comparisons and the TYPE 2 mega-figure within an organoid.
+- If a base_folder has no per-trial XML subfolders to deconcat from,
+  split_combined_suite2p_equal_pre_post() falls back to an equal-halves
+  PRE/POST split.
+- append_summary_row() writes one row per unique recording (not per
+  pairwise comparison) to SUMMARY_CSV_PATH.
 
 ===============================================================================
 """
@@ -40,6 +57,15 @@ import re
 warnings.filterwarnings('ignore')
 
 from helper import files, TwoP, process_spike_data_gcamp6m
+
+# Number of circular-shift iterations for the shuffled (chance) cross-correlation
+# baseline. Change this single constant to adjust it everywhere it's used.
+N_SHUFFLES = 1000
+
+# Path to the running per-recording correlation summary CSV, one row per
+# unique PRE/POST recording (not per pairwise comparison). Set once per
+# batch run inside batch_process_organoids_enhanced().
+SUMMARY_CSV_PATH = None
 
 # ============================================================================
 # DECONCAT FUNCTIONS - Run these first if needed
@@ -82,23 +108,26 @@ def Frame_Detector_Per_Lap(base_folder):
                 return (1, 999)  # Fallback for malformed names
     
     recording_folderlist = sorted(recording_folderlist, key=sort_key)
-    
+
     num_recordings = len(recording_folderlist)
     print(f"Subfolders found (sorted): {recording_folderlist}")
 
-    suite2p_folders = []
+    if num_recordings == 0:
+        print("No per-trial subfolders (with their own .xml) found -- "
+              "nothing to derive PRE/POST frame counts from.")
+        return None
+
+    suite2p_folders = None
     for item in os.scandir(base_folder):
         if item.is_dir():
             plane0_path = os.path.join(item.path, 'plane0')
             if os.path.exists(plane0_path):
                 suite2p_folders = os.path.join(base_folder, item.name)
 
-    if len(suite2p_folders) == 0:
+    if suite2p_folders is None:
         print("No recordings found with Suite2p data")
-        return
+        return None
 
-    print(f"Found {len(suite2p_folders)} recordings")
-    
     ops_path = os.path.join(suite2p_folders, 'plane0', 'ops.npy')
     ops = np.load(ops_path, allow_pickle=True).item()
     total_frames = ops['nframes']
@@ -216,6 +245,60 @@ def deconcat_suite2p_output(frame_info, recording_folder):
     else:
         print("No Suite2p folder found. Exiting deconcatenation.")
     return cumulative_frames
+
+
+def split_combined_suite2p_equal_pre_post(organoid_folder, organoid_name):
+    """
+    Fallback deconcat for organoid folders that hold a single combined
+    suite2p output (PRE + POST concatenated) with no per-trial XML
+    subfolders to read frame counts from (Frame_Detector_Per_Lap
+    returns None in that case).
+
+    Splits the recording into two equal halves by frame count: first
+    half = PRE, second half = POST. Any trailing _GZ on organoid_name
+    is stripped first so the PRE subfolder's name doesn't itself look
+    like a POST folder to the _GZ-based classifier used elsewhere.
+    """
+
+    suite2p_dir = os.path.join(organoid_folder, 'suite2p', 'plane0')
+
+    F = np.load(os.path.join(suite2p_dir, 'F.npy'), allow_pickle=True)
+    Fneu = np.load(os.path.join(suite2p_dir, 'Fneu.npy'), allow_pickle=True)
+    spks = np.load(os.path.join(suite2p_dir, 'spks.npy'), allow_pickle=True)
+    stat = np.load(os.path.join(suite2p_dir, 'stat.npy'), allow_pickle=True)
+    ops = np.load(os.path.join(suite2p_dir, 'ops.npy'), allow_pickle=True).item()
+    iscell = np.load(os.path.join(suite2p_dir, 'iscell.npy'), allow_pickle=True)
+
+    usecells = iscell[:, 0] == 1
+    twoP_data = {
+        'F': F[usecells, :],
+        'Fneu': Fneu[usecells, :],
+        'spks': spks[usecells, :],
+        'stat': stat[usecells],
+        'ops': ops,
+        'iscell': iscell[usecells, :],
+    }
+
+    total_frames = twoP_data['F'].shape[1]
+    n_pre = total_frames // 2
+    if total_frames % 2 != 0:
+        print(f"  ⚠️  {total_frames} frames is odd -- splitting {n_pre}/{total_frames - n_pre}")
+
+    base_name = re.sub(r'[_-]GZ$', '', organoid_name, flags=re.IGNORECASE)
+    trial_ranges = {
+        base_name: (0, n_pre),
+        f'{base_name}_GZ-001': (n_pre, total_frames),
+    }
+
+    for trial_name, (start, end) in trial_ranges.items():
+        output_dir = os.path.join(organoid_folder, trial_name, 'suite2p', 'plane0')
+        os.makedirs(output_dir, exist_ok=True)
+        for key, data in twoP_data.items():
+            data_split = data[:, start:end] if key in ('F', 'Fneu', 'spks') else data
+            np.save(os.path.join(output_dir, f'{key}.npy'), data_split)
+        print(f"  ✓ Saved {trial_name}: frames {start}-{end} ({end - start} frames)")
+
+    return trial_ranges
 
 # ============================================================================
 # NEW: Parse folder name to detect multiple post recordings
@@ -391,78 +474,306 @@ def event_based_snr_filter(dff_data, spike_data, stage1_mask,
     
     return stage2_mask, filtering_stats
 
-def calculate_cross_correlation_with_lags(data, max_lag=3):
-    """Calculate cross-correlation with time lags for all cell pairs"""
-    
+def calculate_cross_correlation_with_lags(data, max_lag=3, verbose=True):
+    """Calculate cross-correlation with time lags for all cell pairs (vectorized)"""
+
     n_cells, n_frames = data.shape
-    
-    print(f"\nCalculating cross-correlations with ±{max_lag} frame lags...")
-    
+
+    if verbose:
+        print(f"\nCalculating cross-correlations with ±{max_lag} frame lags (vectorized)...")
+
     max_corr_matrix = np.zeros((n_cells, n_cells))
     best_lag_matrix = np.zeros((n_cells, n_cells), dtype=int)
     standard_corr_matrix = np.zeros((n_cells, n_cells))
-    
-    total_pairs = n_cells * (n_cells - 1) // 2
-    
-    with tqdm(total=total_pairs, desc="Cell pairs") as pbar:
-        for i in range(n_cells):
-            for j in range(i+1, n_cells):
-                signal_i = data[i, :]
-                signal_j = data[j, :]
-                
-                signal_i_norm = (signal_i - np.mean(signal_i)) / (np.std(signal_i) + 1e-10)
-                signal_j_norm = (signal_j - np.mean(signal_j)) / (np.std(signal_j) + 1e-10)
-                
-                correlations = []
-                lags = range(-max_lag, max_lag + 1)
-                
-                for lag in lags:
-                    if lag < 0:
-                        overlap_i = signal_i_norm[:lag]
-                        overlap_j = signal_j_norm[-lag:]
-                    elif lag > 0:
-                        overlap_i = signal_i_norm[lag:]
-                        overlap_j = signal_j_norm[:-lag]
-                    else:
-                        overlap_i = signal_i_norm
-                        overlap_j = signal_j_norm
-                    
-                    if len(overlap_i) > 10:
-                        corr = np.corrcoef(overlap_i, overlap_j)[0, 1]
-                        correlations.append(corr if not np.isnan(corr) else 0.0)
-                    else:
-                        correlations.append(0.0)
-                
-                correlations = np.array(correlations)
-                max_corr_idx = np.argmax(correlations)
-                max_corr = correlations[max_corr_idx]
-                best_lag = list(lags)[max_corr_idx]
-                
-                max_corr_matrix[i, j] = max_corr
-                max_corr_matrix[j, i] = max_corr
-                best_lag_matrix[i, j] = best_lag
-                best_lag_matrix[j, i] = -best_lag
-                standard_corr_matrix[i, j] = correlations[max_lag]
-                standard_corr_matrix[j, i] = correlations[max_lag]
-                
-                pbar.update(1)
-    
+
+    means = data.mean(axis=1, keepdims=True)
+    stds = data.std(axis=1, keepdims=True)
+    norm_data = (data - means) / (stds + 1e-10)
+
+    lags = list(range(-max_lag, max_lag + 1))
+    all_corrs = np.zeros((len(lags), n_cells, n_cells))
+
+    for li, lag in enumerate(lags):
+        if lag < 0:
+            A = norm_data[:, :lag]
+            B = norm_data[:, -lag:]
+        elif lag > 0:
+            A = norm_data[:, lag:]
+            B = norm_data[:, :-lag]
+        else:
+            A = norm_data
+            B = norm_data
+
+        if A.shape[1] <= 10:  # Need sufficient overlap
+            continue
+
+        Ac = A - A.mean(axis=1, keepdims=True)
+        Bc = B - B.mean(axis=1, keepdims=True)
+        norm_A = np.sqrt((Ac ** 2).sum(axis=1))
+        norm_B = np.sqrt((Bc ** 2).sum(axis=1))
+        denom = np.outer(norm_A, norm_B)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = (Ac @ Bc.T) / denom
+        corr[denom == 0] = 0.0
+        all_corrs[li] = np.nan_to_num(corr, nan=0.0)
+
+    max_corr_vals = np.max(all_corrs, axis=0)
+    best_lag_idx = np.argmax(all_corrs, axis=0)
+    lags_arr = np.array(lags)
+    best_lag_vals = lags_arr[best_lag_idx]
+    standard_corr_vals = all_corrs[max_lag]  # lag == 0 slice (center of lag range)
+
+    iu, ju = np.triu_indices(n_cells, k=1)
+
+    max_corr_matrix[iu, ju] = max_corr_vals[iu, ju]
+    max_corr_matrix[ju, iu] = max_corr_vals[iu, ju]
+
+    best_lag_matrix[iu, ju] = best_lag_vals[iu, ju]
+    best_lag_matrix[ju, iu] = -best_lag_vals[iu, ju]
+
+    standard_corr_matrix[iu, ju] = standard_corr_vals[iu, ju]
+    standard_corr_matrix[ju, iu] = standard_corr_vals[iu, ju]
+
     np.fill_diagonal(max_corr_matrix, 1.0)
     np.fill_diagonal(standard_corr_matrix, 1.0)
     np.fill_diagonal(best_lag_matrix, 0)
-    
+
     upper_tri = np.triu_indices_from(max_corr_matrix, k=1)
     max_correlations = max_corr_matrix[upper_tri]
     valid_corr = max_correlations[~np.isnan(max_correlations)]
-    
+
     correlation_stats = {
         'mean_max_correlation': np.mean(valid_corr) if len(valid_corr) > 0 else 0,
         'median_max_correlation': np.median(valid_corr) if len(valid_corr) > 0 else 0,
     }
-    
-    print(f"  Mean correlation: {correlation_stats['mean_max_correlation']:.3f}")
-    
+
+    if verbose:
+        print(f"  Mean correlation: {correlation_stats['mean_max_correlation']:.3f}")
+
     return max_corr_matrix, best_lag_matrix, standard_corr_matrix, correlation_stats
+
+
+def calculate_shuffled_cross_correlation_baseline(data, max_lag=3, n_shuffles=1000, verbose=False):
+    """
+    Estimate the chance-level cross-correlation by independently circularly
+    shifting each cell's trace and recomputing the mean max cross-correlation,
+    repeated n_shuffles times.
+
+    Returns:
+        shuffle_stats: dict with 'mean_random_max_correlation', 'std_random_max_correlation',
+            and 'shuffle_mean_max_correlations' (the per-iteration values)
+    """
+
+    n_cells, n_frames = data.shape
+    shuffle_mean_max_correlations = np.zeros(n_shuffles)
+
+    if verbose:
+        print(f"\nComputing shuffled (chance) cross-correlation baseline ({n_shuffles} iterations)...")
+
+    for s in tqdm(range(n_shuffles), desc="Shuffle iterations", disable=not verbose):
+        shuffled_data = np.zeros_like(data)
+        for i in range(n_cells):
+            shift = np.random.randint(0, n_frames)
+            shuffled_data[i] = np.roll(data[i], shift)
+
+        _, _, _, shuffled_corr_stats = calculate_cross_correlation_with_lags(
+            shuffled_data, max_lag=max_lag, verbose=False
+        )
+        shuffle_mean_max_correlations[s] = shuffled_corr_stats.get('mean_max_correlation', 0)
+
+    mean_random_max_correlation = float(np.mean(shuffle_mean_max_correlations))
+    std_random_max_correlation = float(np.std(shuffle_mean_max_correlations))
+
+    if verbose:
+        print(f"  Random (chance) mean max correlation: "
+              f"{mean_random_max_correlation:.3f} ± {std_random_max_correlation:.3f}")
+
+    shuffle_stats = {
+        'mean_random_max_correlation': mean_random_max_correlation,
+        'std_random_max_correlation': std_random_max_correlation,
+        'shuffle_mean_max_correlations': shuffle_mean_max_correlations,
+        'n_shuffles': n_shuffles
+    }
+
+    return shuffle_stats
+
+
+def append_summary_row(organoid_name, rec_name, condition, result):
+    """Append one row (per unique recording) to SUMMARY_CSV_PATH. No-op if
+    SUMMARY_CSV_PATH hasn't been set (e.g. when calling analysis functions
+    outside batch_process_organoids_enhanced)."""
+
+    if SUMMARY_CSV_PATH is None:
+        return
+
+    row = {
+        'organoid_name': organoid_name,
+        'rec_name': rec_name,
+        'condition': condition,
+        'n_cells_filtered': int(result['spikes_filtered'].shape[0]),
+        'n_cells_original': result['n_cells_original'],
+        'spikes_max_corr': result['corr_stats']['mean_max_correlation'],
+        'spikes_random_mean_corr': result['shuffle_stats']['mean_random_max_correlation'],
+    }
+    pd.DataFrame([row]).to_csv(
+        SUMMARY_CSV_PATH, mode='a',
+        header=not os.path.exists(SUMMARY_CSV_PATH), index=False
+    )
+
+
+def get_pre_recording_data(pre_path, cache, organoid_name=None, n_shuffles=N_SHUFFLES, max_lag=3):
+    """
+    Load, dFF, spike, filter (using this PRE recording's own data),
+    correlate, and compute the shuffle baseline for a PRE recording.
+
+    Cached by pre_path: calling this again for the same PRE (e.g. from a
+    different PRE x POST pairing, or from the TYPE 2 mega-figure block)
+    returns the cached result instantly instead of recomputing.
+    """
+
+    if pre_path in cache:
+        return cache[pre_path]
+
+    print(f"\n  Processing PRE recording: {os.path.basename(pre_path)}")
+
+    F_pre = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'F.npy'), allow_pickle=True)
+    Fneu_pre = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'Fneu.npy'), allow_pickle=True)
+    stat = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'stat.npy'), allow_pickle=True)
+    ops = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'ops.npy'), allow_pickle=True).item()
+
+    n_cells = F_pre.shape[0]
+
+    pre_name = os.path.basename(pre_path)
+    xml_path = os.path.join(pre_path, f"{pre_name}.xml")
+    if os.path.exists(xml_path):
+        try:
+            xml_dict = files.read_xml(xml_path)
+            frame_rate = 1 / xml_dict["rel_time"][1]
+        except:
+            frame_rate = 15.0
+    else:
+        frame_rate = 15.0
+
+    F_pre = F_pre.astype(np.float64)
+    Fneu_pre = Fneu_pre.astype(np.float64)
+    dff_pre = (F_pre - 0.7 * Fneu_pre) / (F_pre - 0.7 * Fneu_pre).mean(axis=1, keepdims=True)
+    _, spikes_pre = process_spike_data_gcamp6m(dff_pre, n_cells, F_pre.shape[1], sampling_rate=frame_rate)
+
+    stage1_mask, stage1_stats = basic_signal_quality_filter(
+        dff_pre, spikes_pre,
+        peak_percentile=10,
+        variance_low_percentile=10,
+        variance_high_percentile=95,
+        use_dff_for_filtering=False
+    )
+    final_mask, stage2_stats = event_based_snr_filter(
+        dff_pre, spikes_pre, stage1_mask,
+        snr_threshold=1.2,
+        min_events=1,
+        threshold_factor=2.0,
+        min_duration=3,
+        sampling_rate=frame_rate
+    )
+
+    dff_pre_filtered = dff_pre[final_mask, :]
+    spikes_pre_filtered = spikes_pre[final_mask, :]
+    stat_filtered = stat[final_mask]
+
+    corr_max, corr_lag, corr_std, corr_stats = calculate_cross_correlation_with_lags(
+        spikes_pre_filtered, max_lag=max_lag, verbose=False
+    )
+    shuffle_stats = calculate_shuffled_cross_correlation_baseline(
+        spikes_pre_filtered, max_lag=max_lag, n_shuffles=n_shuffles, verbose=False
+    )
+
+    print(f"    Cells filtered: {np.sum(final_mask)}/{n_cells}  |  "
+          f"Real: {corr_stats['mean_max_correlation']:.3f}  |  "
+          f"Random: {shuffle_stats['mean_random_max_correlation']:.3f}")
+
+    result = {
+        'path': pre_path,
+        'dff_filtered': dff_pre_filtered,
+        'spikes_filtered': spikes_pre_filtered,
+        'stat_filtered': stat_filtered,
+        'ops': ops,
+        'mask': final_mask,
+        'frame_rate': frame_rate,
+        'n_cells_original': n_cells,
+        'corr_max': corr_max,
+        'corr_stats': corr_stats,
+        'shuffle_stats': shuffle_stats,
+    }
+    cache[pre_path] = result
+    append_summary_row(organoid_name, pre_name, 'PRE', result)
+    return result
+
+
+def get_post_recording_data(post_path, pre_result, cache, organoid_name=None, n_shuffles=N_SHUFFLES, max_lag=3):
+    """
+    Load, dFF, spike a POST recording, apply the mask derived from its
+    matched PRE recording (not its own), correlate, and compute the
+    shuffle baseline.
+
+    Cached by (post_path, id of the mask that produced it): the common
+    case (one PRE, several POSTs) collapses to one cache entry per POST.
+    If the same POST is ever paired with a different PRE (a different
+    mask), it's correctly recomputed for that mask rather than reusing a
+    stale result.
+    """
+
+    key = (post_path, id(pre_result['mask']))
+    if key in cache:
+        return cache[key]
+
+    print(f"\n  Processing POST recording: {os.path.basename(post_path)}")
+
+    F_post = np.load(os.path.join(post_path, 'suite2p', 'plane0', 'F.npy'), allow_pickle=True)
+    Fneu_post = np.load(os.path.join(post_path, 'suite2p', 'plane0', 'Fneu.npy'), allow_pickle=True)
+
+    n_cells_post = F_post.shape[0]
+    mask = pre_result['mask']
+    if n_cells_post != len(mask):
+        raise ValueError(
+            f"Cell count mismatch! PRE ({os.path.basename(pre_result['path'])}) has "
+            f"{len(mask)} cells, POST ({os.path.basename(post_path)}) has {n_cells_post}"
+        )
+
+    frame_rate = pre_result['frame_rate']
+
+    F_post = F_post.astype(np.float64)
+    Fneu_post = Fneu_post.astype(np.float64)
+    dff_post = (F_post - 0.7 * Fneu_post) / (F_post - 0.7 * Fneu_post).mean(axis=1, keepdims=True)
+    _, spikes_post = process_spike_data_gcamp6m(dff_post, n_cells_post, F_post.shape[1], sampling_rate=frame_rate)
+
+    dff_post_filtered = dff_post[mask, :]
+    spikes_post_filtered = spikes_post[mask, :]
+
+    corr_max, corr_lag, corr_std, corr_stats = calculate_cross_correlation_with_lags(
+        spikes_post_filtered, max_lag=max_lag, verbose=False
+    )
+    shuffle_stats = calculate_shuffled_cross_correlation_baseline(
+        spikes_post_filtered, max_lag=max_lag, n_shuffles=n_shuffles, verbose=False
+    )
+
+    print(f"    Cells: {np.sum(mask)}/{n_cells_post}  |  "
+          f"Real: {corr_stats['mean_max_correlation']:.3f}  |  "
+          f"Random: {shuffle_stats['mean_random_max_correlation']:.3f}")
+
+    result = {
+        'path': post_path,
+        'dff_filtered': dff_post_filtered,
+        'spikes_filtered': spikes_post_filtered,
+        'frame_rate': frame_rate,
+        'n_cells_original': n_cells_post,
+        'corr_max': corr_max,
+        'corr_stats': corr_stats,
+        'shuffle_stats': shuffle_stats,
+    }
+    cache[key] = result
+    append_summary_row(organoid_name, os.path.basename(post_path), 'POST', result)
+    return result
+
 
 def identify_top_synchronous_cells(correlation_matrix, n_cells=10):
     """Identify top N most synchronous cells based on mean correlation"""
@@ -505,8 +816,6 @@ def create_matched_visualization(
     
     fig = plt.figure(figsize=(20, 22))
     
-    # ... [Keep all the panel positioning code - lines 390-420] ...
-    
     panel_width = 0.35
     panel_height = 0.25
     colorbar_width = 0.015
@@ -542,7 +851,7 @@ def create_matched_visualization(
     cbar_ax_pre = fig.add_axes([bottom_left_colorbar+0.01, bottom_row_y, colorbar_width, panel_height])
     cbar_ax_post = fig.add_axes([bottom_right_colorbar-0.05, bottom_row_y, colorbar_width, panel_height])
     
-    # ROW 1: Average projections [Keep as is - lines 432-458]
+    # ROW 1: Average projections
     ax_img_pre.imshow(avg_projection, cmap='gray', aspect='equal',
                       vmin=np.percentile(avg_projection, 1),
                       vmax=np.percentile(avg_projection, 99.5))
@@ -567,7 +876,7 @@ def create_matched_visualization(
                           fontsize=18, weight='bold', pad=10)
     ax_img_post.axis('off')
     
-    # ROW 2: DFF Traces [Keep as is - lines 460-520]
+    # ROW 2: DFF Traces
     dff_traces_pre = dff_pre[sync_cell_indices, :]
     time_vector_pre = np.arange(dff_traces_pre.shape[1]) / frame_rate
     
@@ -620,15 +929,13 @@ def create_matched_visualization(
     ax_traces_post.grid(True, alpha=0.2, linestyle=':', linewidth=0.5)
     ax_traces_post.set_aspect('equal')
     
-    # ROW 3: Correlation Heatmaps - UPDATED WITH BOTH METRICS
-    # PRE correlation matrix
+    # ROW 3: Correlation Heatmaps
     corr_pre_subset = np.zeros((n_cells, n_cells))
     corr_matrix_pre_full = np.corrcoef(dff_pre)
     for i, idx_i in enumerate(sync_cell_indices):
         for j, idx_j in enumerate(sync_cell_indices):
             corr_pre_subset[i, j] = corr_matrix_pre_full[idx_i, idx_j]
     
-    # Calculate top 10 mean for PRE
     upper_tri_pre = np.triu_indices_from(corr_pre_subset, k=1)
     mean_corr_pre_top10 = np.mean(corr_pre_subset[upper_tri_pre])
     mean_corr_pre_global = corr_pre_stats['mean_max_correlation']
@@ -652,14 +959,12 @@ def create_matched_visualization(
     cbar_pre.set_label('Correlation', fontsize=14, weight='bold')
     cbar_pre.ax.tick_params(labelsize=14)
 
-    # POST correlation matrix
     corr_post_subset = np.zeros((n_cells, n_cells))
     corr_matrix_post_full = np.corrcoef(dff_post)
     for i, idx_i in enumerate(sync_cell_indices):
         for j, idx_j in enumerate(sync_cell_indices):
             corr_post_subset[i, j] = corr_matrix_post_full[idx_i, idx_j]
     
-    # Calculate top 10 mean for POST
     upper_tri_post = np.triu_indices_from(corr_post_subset, k=1)
     mean_corr_post_top10 = np.mean(corr_post_subset[upper_tri_post])
     mean_corr_post_global = corr_post_stats['mean_max_correlation']
@@ -683,7 +988,7 @@ def create_matched_visualization(
     cbar_post.set_label('Correlation', fontsize=14, weight='bold')
     cbar_post.ax.tick_params(labelsize=10)
     
-    # ROW 4: Legend [Keep as is]
+    # ROW 4: Legend
     ax_legend = fig.add_axes([0.1, 0.02, 0.8, 0.06])
     ax_legend.axis('off')
     
@@ -710,7 +1015,6 @@ def create_matched_visualization(
     plt.close(fig)
     plt.rcParams.update(plt.rcParamsDefault)
     
-    # Return both correlation metrics
     correlation_metrics = {
         'pre_global': mean_corr_pre_global,
         'pre_top10': mean_corr_pre_top10,
@@ -750,7 +1054,6 @@ def create_mega_figure_all_recordings(
     if n_recordings == 1:
         axes = axes.reshape(-1, 1)
     
-    # Store correlation metrics for return
     all_correlation_metrics = []
     
     for col_idx, (dff, spike, corr_stats, label) in enumerate(
@@ -759,7 +1062,7 @@ def create_mega_figure_all_recordings(
         dff_subset = dff[sync_cell_indices, :]
         spike_subset = spike[sync_cell_indices, :]
         
-        # ROW 0: Field of View [Keep as is]
+        # ROW 0: Field of View
         ax_img = axes[0, col_idx]
         ax_img.imshow(avg_projection, cmap='gray', aspect='equal',
                       vmin=np.percentile(avg_projection, 1),
@@ -773,7 +1076,7 @@ def create_mega_figure_all_recordings(
                         fontsize=14, weight='bold', pad=8)
         ax_img.axis('off')
         
-        # ROW 1: Calcium Traces [Keep as is]
+        # ROW 1: Calcium Traces
         ax_traces = axes[1, col_idx]
         
         time_vector = np.arange(dff_subset.shape[1]) / frame_rate
@@ -798,7 +1101,7 @@ def create_mega_figure_all_recordings(
         ax_traces.spines['right'].set_visible(False)
         ax_traces.grid(True, alpha=0.2, linestyle=':', linewidth=0.5)
         
-        # ROW 2: Correlation Matrix - UPDATED WITH BOTH METRICS
+        # ROW 2: Correlation Matrix
         ax_corr = axes[2, col_idx]
         
         corr_subset = np.zeros((n_cells, n_cells))
@@ -807,12 +1110,10 @@ def create_mega_figure_all_recordings(
             for j, idx_j in enumerate(sync_cell_indices):
                 corr_subset[i, j] = corr_matrix_full[idx_i, idx_j]
         
-        # Calculate BOTH correlations
         upper_tri = np.triu_indices_from(corr_subset, k=1)
         mean_corr_top10 = np.mean(corr_subset[upper_tri])
         mean_corr_global = corr_stats['mean_max_correlation']
         
-        # Store for later
         all_correlation_metrics.append({
             'label': label,
             'global': mean_corr_global,
@@ -839,7 +1140,7 @@ def create_mega_figure_all_recordings(
             cbar = plt.colorbar(im, ax=ax_corr, fraction=0.046, pad=0.04)
             cbar.set_label('Correlation', fontsize=11, weight='bold')
     
-    # Legend at bottom [Keep as is]
+    # Legend at bottom
     fig.subplots_adjust(bottom=0.08)
     ax_legend = fig.add_axes([0.1, 0.02, 0.8, 0.04])
     ax_legend.axis('off')
@@ -879,74 +1180,49 @@ def create_mega_figure_all_recordings(
 # ============================================================================
 
 def analyze_matched_pregaba_recording(
-    dff_pre, dff_post,
-    spikes_pre, spikes_post,
-    stat, ops,
-    frame_rate,
+    pre_data,
+    post_data,
     rec_name,
     output_folder,
     n_sync_cells=10,
     max_lag=3
 ):
-    """Complete analysis pipeline for matched pre/post gabazine data"""
-    
+    """Complete analysis pipeline for matched pre/post gabazine data.
+
+    Filtering, correlation, and shuffle baselines are computed once by
+    get_pre_recording_data / get_post_recording_data (and cached there) --
+    this function only consumes the already-computed results.
+    """
+
     os.makedirs(output_folder, exist_ok=True)
-    
+
+    dff_pre_filtered = pre_data['dff_filtered']
+    spikes_pre_filtered = pre_data['spikes_filtered']
+    dff_post_filtered = post_data['dff_filtered']
+    spikes_post_filtered = post_data['spikes_filtered']
+    stat_filtered = pre_data['stat_filtered']
+    ops = pre_data['ops']
+    frame_rate = pre_data['frame_rate']
+    final_mask = pre_data['mask']
+
+    corr_pre_max, corr_pre_stats = pre_data['corr_max'], pre_data['corr_stats']
+    corr_post_max, corr_post_stats = post_data['corr_max'], post_data['corr_stats']
+    pre_shuffle_stats = pre_data['shuffle_stats']
+    post_shuffle_stats = post_data['shuffle_stats']
+
     print(f"\n{'='*80}")
     print(f"MATCHED PRE/POST GABAZINE ANALYSIS: {rec_name}")
     print(f"{'='*80}")
-    print(f"Pre-gabazine:  {dff_pre.shape[0]} cells, {dff_pre.shape[1]} frames")
-    print(f"Post-gabazine: {dff_post.shape[0]} cells, {dff_post.shape[1]} frames")
+    print(f"Pre-gabazine:  {dff_pre_filtered.shape[0]} cells (filtered), {dff_pre_filtered.shape[1]} frames")
+    print(f"Post-gabazine: {dff_post_filtered.shape[0]} cells (filtered), {dff_post_filtered.shape[1]} frames")
     print(f"Frame rate: {frame_rate:.2f} Hz")
-    
-    # STEP 1: Filter using PRE-gabazine data ONLY
-    print(f"\n{'='*80}")
-    print("STEP 1: Filtering (based on PRE-gabazine only)")
-    print(f"{'='*80}")
-    
-    stage1_mask, stage1_stats = basic_signal_quality_filter(
-        dff_pre, spikes_pre,
-        peak_percentile=10,
-        variance_low_percentile=10,
-        variance_high_percentile=95,
-        use_dff_for_filtering=False
-    )
-    
-    final_mask, stage2_stats = event_based_snr_filter(
-        dff_pre, spikes_pre, stage1_mask,
-        snr_threshold=1.2,
-        min_events=1,
-        threshold_factor=2.0,
-        min_duration=3,
-        sampling_rate=frame_rate
-    )
-    
-    print(f"\nFiltering complete:")
-    print(f"  Original cells: {dff_pre.shape[0]}")
-    print(f"  After Stage 1: {np.sum(stage1_mask)}")
-    print(f"  After Stage 2: {np.sum(final_mask)}")
-    print(f"  **SAME MASK APPLIED TO POST-GABAZINE**")
-    
-    # Apply mask to both conditions
-    dff_pre_filtered = dff_pre[final_mask, :]
-    dff_post_filtered = dff_post[final_mask, :]
-    spikes_pre_filtered = spikes_pre[final_mask, :]
-    spikes_post_filtered = spikes_post[final_mask, :]
-    stat_filtered = stat[final_mask]
-    
-    # STEP 2: Calculate correlations separately
-    print(f"\n{'='*80}")
-    print("STEP 2: Cross-correlation analysis")
-    print(f"{'='*80}")
-    
-    print("\n--- PRE-GABAZINE ---")
-    corr_pre_max, corr_pre_lag, corr_pre_std, corr_pre_stats = \
-        calculate_cross_correlation_with_lags(spikes_pre_filtered, max_lag=max_lag)
-    
-    print("\n--- POST-GABAZINE ---")
-    corr_post_max, corr_post_lag, corr_post_std, corr_post_stats = \
-        calculate_cross_correlation_with_lags(spikes_post_filtered, max_lag=max_lag)
-    
+    print(f"  **SAME MASK APPLIED TO POST-GABAZINE** ({np.sum(final_mask)}/{pre_data['n_cells_original']} cells)")
+    print(f"\nUsing cached filtering + correlation + shuffle baseline:")
+    print(f"  PRE  correlation: real={corr_pre_stats['mean_max_correlation']:.3f}, "
+          f"random={pre_shuffle_stats['mean_random_max_correlation']:.3f}")
+    print(f"  POST correlation: real={corr_post_stats['mean_max_correlation']:.3f}, "
+          f"random={post_shuffle_stats['mean_random_max_correlation']:.3f}")
+
     # STEP 3: Identify synchronous cells from PRE
     print(f"\n{'='*80}")
     print("STEP 3: Identifying synchronous cells from PRE-gabazine")
@@ -995,7 +1271,6 @@ def analyze_matched_pregaba_recording(
     
     output_path = os.path.join(output_folder, f"{rec_name}_matched_pregaba_analysis.png")
     
-    # UPDATED: Capture correlation metrics
     fig, correlation_metrics = create_matched_visualization(
         dff_pre_filtered, dff_post_filtered,
         spikes_pre_filtered, spikes_post_filtered,
@@ -1012,9 +1287,9 @@ def analyze_matched_pregaba_recording(
         'recording_info': {
             'recording_name': rec_name,
             'frame_rate': frame_rate,
-            'n_frames_pre': dff_pre.shape[1],
-            'n_frames_post': dff_post.shape[1],
-            'n_cells_original': dff_pre.shape[0],
+            'n_frames_pre': dff_pre_filtered.shape[1],
+            'n_frames_post': dff_post_filtered.shape[1],
+            'n_cells_original': pre_data['n_cells_original'],
             'n_cells_filtered': np.sum(final_mask),
         },
         'comparison': {
@@ -1026,31 +1301,35 @@ def analyze_matched_pregaba_recording(
             'global_correlation_change_percent': ((correlation_metrics['post_global'] / (correlation_metrics['pre_global'] + 1e-10)) - 1) * 100,
             'top10_correlation_change': correlation_metrics['post_top10'] - correlation_metrics['pre_top10'],
             'top10_correlation_change_percent': ((correlation_metrics['post_top10'] / (correlation_metrics['pre_top10'] + 1e-10)) - 1) * 100,
+            'pre_random_mean_correlation': pre_shuffle_stats['mean_random_max_correlation'],
+            'post_random_mean_correlation': post_shuffle_stats['mean_random_max_correlation'],
         },
         'sync_cell_indices': original_sync_indices.tolist(),
         'sync_scores': sync_scores.tolist()
     }
-    
+
     # Save detailed CSV
     condition_stats = pd.DataFrame([
         {
             'Recording': rec_name,
             'Condition': 'PRE',
             'N_Cells_Filtered': np.sum(final_mask),
-            'N_Cells_Original': dff_pre.shape[0],
+            'N_Cells_Original': pre_data['n_cells_original'],
             'Global_Mean_Correlation': correlation_metrics['pre_global'],
             'Top10_Mean_Correlation': correlation_metrics['pre_top10'],
             'Correlation_Difference': correlation_metrics['pre_top10'] - correlation_metrics['pre_global'],
+            'Random_Mean_Correlation': pre_shuffle_stats['mean_random_max_correlation'],
             'Frame_Rate_Hz': frame_rate
         },
         {
             'Recording': rec_name,
             'Condition': 'POST',
             'N_Cells_Filtered': np.sum(final_mask),
-            'N_Cells_Original': dff_pre.shape[0],
+            'N_Cells_Original': pre_data['n_cells_original'],
             'Global_Mean_Correlation': correlation_metrics['post_global'],
             'Top10_Mean_Correlation': correlation_metrics['post_top10'],
             'Correlation_Difference': correlation_metrics['post_top10'] - correlation_metrics['post_global'],
+            'Random_Mean_Correlation': post_shuffle_stats['mean_random_max_correlation'],
             'Frame_Rate_Hz': frame_rate
         }
     ])
@@ -1078,7 +1357,7 @@ def analyze_matched_pregaba_recording(
     print("ANALYSIS COMPLETE - SUMMARY")
     print(f"{'='*80}")
     print(f"\nRecording: {rec_name}")
-    print(f"  Cells filtered: {np.sum(final_mask)}/{dff_pre.shape[0]}")
+    print(f"  Cells filtered: {np.sum(final_mask)}/{pre_data['n_cells_original']}")
     print(f"\n  PRE Correlations:")
     print(f"    Global: {correlation_metrics['pre_global']:.3f}")
     print(f"    Top 10: {correlation_metrics['pre_top10']:.3f}")
@@ -1091,81 +1370,30 @@ def analyze_matched_pregaba_recording(
     
     return results
 
-def analyze_single_pregaba_pair(pre_path, post_path, comparison_name, 
-                                output_folder, n_sync_cells=10, max_lag=3):
+def analyze_single_pregaba_pair(pre_path, post_path, comparison_name,
+                                output_folder, cache, organoid_name,
+                                n_sync_cells=10, max_lag=3):
     """
-    Analyze one PRE vs POST comparison
+    Analyze one PRE vs POST comparison.
+
+    Loading, dFF, filtering, correlation, and shuffle-baseline computation
+    for each recording are handled by get_pre_recording_data /
+    get_post_recording_data, which cache their results (keyed by path) in
+    `cache` so the same PRE (or the same POST under the same mask) is only
+    ever actually computed once, no matter how many pairings reuse it.
     """
-    
-    print(f"\n{'='*70}")
-    print(f"Loading data...")
-    print(f"{'='*70}")
-    
-    # Load PRE data
-    F_pre = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'F.npy'), allow_pickle=True)
-    Fneu_pre = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'Fneu.npy'), allow_pickle=True)
-    iscell = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'iscell.npy'), allow_pickle=True)
-    stat = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'stat.npy'), allow_pickle=True)
-    ops = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'ops.npy'), allow_pickle=True).item()
-    
-    # Load POST data
-    F_post = np.load(os.path.join(post_path, 'suite2p', 'plane0', 'F.npy'), allow_pickle=True)
-    Fneu_post = np.load(os.path.join(post_path, 'suite2p', 'plane0', 'Fneu.npy'), allow_pickle=True)
-    
-    n_cells_pre = F_pre.shape[0]
-    n_cells_post = F_post.shape[0]
-    
-    print(f"PRE:  {n_cells_pre} ROIs, {F_pre.shape[1]} frames")
-    print(f"POST: {n_cells_post} ROIs, {F_post.shape[1]} frames")
-    
-    if n_cells_pre != n_cells_post:
-        raise ValueError(f"Cell count mismatch! PRE: {n_cells_pre}, POST: {n_cells_post}")
-    
-    n_cells = n_cells_pre
-    
-    # Get frame rate
-    pre_name = os.path.basename(pre_path)
-    xml_path = os.path.join(pre_path, f"{pre_name}.xml")
-    
-    if os.path.exists(xml_path):
-        try:
-            xml_dict = files.read_xml(xml_path)
-            frame_rate = 1 / xml_dict["rel_time"][1]
-        except:
-            frame_rate = 15.0
-            print(f"⚠️  Could not read XML, using default frame rate: {frame_rate} Hz")
-    else:
-        frame_rate = 15.0
-        print(f"⚠️  No XML found, using default frame rate: {frame_rate} Hz")
-    
-    print(f"Frame rate: {frame_rate:.2f} Hz")
-    
-    # Calculate dF/F
-    print("\nCalculating dF/F...")
-    dff_pre = (F_pre - 0.7 * Fneu_pre) / (F_pre - 0.7 * Fneu_pre).mean(axis=1, keepdims=True)
-    dff_post = (F_post - 0.7 * Fneu_post) / (F_post - 0.7 * Fneu_post).mean(axis=1, keepdims=True)
-    
-    # Calculate spikes
-    print("Calculating spikes...")
-    _, spikes_pre = process_spike_data_gcamp6m(
-        dff_pre, n_cells, F_pre.shape[1], sampling_rate=frame_rate
-    )
-    _, spikes_post = process_spike_data_gcamp6m(
-        dff_post, n_cells, F_post.shape[1], sampling_rate=frame_rate
-    )
-    
-    # Run analysis
+
+    pre_data = get_pre_recording_data(pre_path, cache, organoid_name=organoid_name, max_lag=max_lag)
+    post_data = get_post_recording_data(post_path, pre_data, cache, organoid_name=organoid_name, max_lag=max_lag)
+
     results = analyze_matched_pregaba_recording(
-        dff_pre, dff_post,
-        spikes_pre, spikes_post,
-        stat, ops,
-        frame_rate,
+        pre_data, post_data,
         comparison_name,
         output_folder,
         n_sync_cells=n_sync_cells,
         max_lag=max_lag
     )
-    
+
     return results
 
 # ============================================================================
@@ -1176,35 +1404,33 @@ def find_organoid_folders_and_pairs_enhanced(base_folder):
     """
     Enhanced version that detects both single and multiple post recordings.
     """
-    
+
     print(f"\n{'='*70}")
     print("SCANNING FOR ORGANOID FOLDERS (ENHANCED)")
     print(f"{'='*70}")
     print(f"Base folder: {base_folder}\n")
-    
+
     organoid_list = []
-    
+
     for item in os.listdir(base_folder):
         item_path = os.path.join(base_folder, item)
-        
+
         if not os.path.isdir(item_path):
             continue
-        
+
         print(f"\nChecking: {item}")
-        
-        # Check for multi-post pattern
+
         has_multi_post, expected_count = parse_folder_for_multi_post(item)
-        
+
         if has_multi_post:
             print(f"  📊 Detected multi-post pattern: expecting {expected_count} recordings")
-        
-        # Look for recording subfolders
-        subfolders = [f for f in os.listdir(item_path) 
+
+        subfolders = [f for f in os.listdir(item_path)
                      if os.path.isdir(os.path.join(item_path, f))]
-        
+
         pre_recordings = []
         post_recordings = []
-        
+
         for subfolder in subfolders:
             if subfolder.lower() == 'suite2p':
                 continue
@@ -1212,17 +1438,17 @@ def find_organoid_folders_and_pairs_enhanced(base_folder):
                 continue
             if 'references' in subfolder.lower():
                 continue
-            
+
             subfolder_path = os.path.join(item_path, subfolder)
             suite2p_path = os.path.join(subfolder_path, 'suite2p', 'plane0')
-            
+
             if os.path.exists(suite2p_path):
                 subfolder_upper = subfolder.upper()
-                has_gz = ('_GZ_' in subfolder_upper or 
+                has_gz = ('_GZ_' in subfolder_upper or
                          '-GZ-' in subfolder_upper or
                          '_GZ-' in subfolder_upper or
                          '-GZ_' in subfolder_upper)
-                
+
                 if has_gz:
                     post_recordings.append(subfolder_path)
                     print(f"  ✓ POST: {subfolder}")
@@ -1231,8 +1457,7 @@ def find_organoid_folders_and_pairs_enhanced(base_folder):
                     print(f"  ✓ PRE:  {subfolder}")
             else:
                 print(f"  ✗ SKIP: {subfolder} (no suite2p/plane0/)")
-        
-        # Organize organoid data
+
         if len(pre_recordings) > 0 or len(post_recordings) > 0:
             organoid_info = {
                 'organoid_name': item,
@@ -1245,91 +1470,98 @@ def find_organoid_folders_and_pairs_enhanced(base_folder):
                 'expected_count': expected_count
             }
             organoid_list.append(organoid_info)
-            
+
             print(f"  📊 Summary: {len(pre_recordings)} PRE, {len(post_recordings)} POST")
-            
-            # Validation for multi-post
+
             if has_multi_post:
                 actual_total = len(pre_recordings) + len(post_recordings)
                 if actual_total != expected_count:
                     print(f"  ⚠️  WARNING: Expected {expected_count} recordings, found {actual_total}")
-            
+
             if len(pre_recordings) == 0:
                 print(f"  ⚠️  WARNING: No PRE recordings found!")
             if len(post_recordings) == 0:
                 print(f"  ⚠️  WARNING: No POST recordings found!")
         else:
             print(f"  ⚠️  No deconcat'd recordings found")
-    
+
     print(f"\n{'='*70}")
     print(f"Found {len(organoid_list)} organoid folders with recordings")
     print(f"{'='*70}\n")
-    
+
     return organoid_list
 
 def batch_process_organoids_enhanced(base_folder):
     """
     ENHANCED: Process all organoids, handling both single and multiple post recordings
     """
-    
+    global SUMMARY_CSV_PATH
+    SUMMARY_CSV_PATH = os.path.join(base_folder, 'gabazine_correlation_summary.csv')
+
     print(f"\n{'='*80}")
     print("BATCH PROCESSING: ENHANCED ORGANOID PRE/POST GABAZINE ANALYSIS")
     print(f"{'='*80}")
     print(f"Base folder: {base_folder}")
-    
-    # Find all organoids
+    print(f"Correlation summary CSV: {SUMMARY_CSV_PATH}")
+
     organoid_list = find_organoid_folders_and_pairs_enhanced(base_folder)
-    
+
     if len(organoid_list) == 0:
         print("\n❌ No organoid folders found!")
         return None
-    
+
     all_results = []
-    
+
     for organoid_info in organoid_list:
         organoid_name = organoid_info['organoid_name']
         organoid_path = organoid_info['organoid_path']
         pre_recs = organoid_info['pre_recordings']
         post_recs = organoid_info['post_recordings']
         has_multi_post = organoid_info['has_multi_post']
-        
+
+        # One cache per organoid: every unique PRE/POST recording within
+        # this organoid gets loaded, filtered, correlated, and shuffled at
+        # most once, then reused across every TYPE 1 pairing and TYPE 2.
+        recording_cache = {}
+
         print(f"\n{'='*80}")
         print(f"PROCESSING ORGANOID: {organoid_name}")
         print(f"{'='*80}")
         print(f"PRE recordings:  {len(pre_recs)}")
         print(f"POST recordings: {len(post_recs)}")
         print(f"Multi-post mode: {has_multi_post}")
-        
+
         if len(pre_recs) == 0 or len(post_recs) == 0:
             print(f"\n⚠️  Skipping - insufficient recordings")
             continue
-        
-        # Create output folder
-        output_folder = os.path.join(organoid_path, 
+
+        output_folder = os.path.join(organoid_path,
                                     f'analysis_{datetime.datetime.now().strftime("%Y%m%d")}')
         os.makedirs(output_folder, exist_ok=True)
-        
+
         # ====================================================================
         # TYPE 1: Individual PRE vs POST comparisons
         # ====================================================================
         print(f"\n{'='*70}")
         print("TYPE 1: Individual PRE vs POST Comparisons")
         print(f"{'='*70}")
-        
+
         for pre_idx, pre_path in enumerate(pre_recs, 1):
             for post_idx, post_path in enumerate(post_recs, 1):
-                
+
                 comparison_name = f"{organoid_name}_PRE{pre_idx}_vs_POST{post_idx}"
-                
+
                 print(f"\n{'-'*70}")
                 print(f"Comparison: {comparison_name}")
                 print(f"{'-'*70}")
-                
+
                 try:
                     results = analyze_single_pregaba_pair(
                         pre_path, post_path,
                         comparison_name,
                         output_folder,
+                        recording_cache,
+                        organoid_name,
                         n_sync_cells=10,
                         max_lag=3
                     )
@@ -1343,9 +1575,11 @@ def batch_process_organoids_enhanced(base_folder):
                         'pre_corr_global': results['comparison']['mean_correlation_pre_global'],
                         'pre_corr_top10': results['comparison']['mean_correlation_pre_top10'],
                         'post_corr_global': results['comparison']['mean_correlation_post_global'],
-                        'post_corr_top10': results['comparison']['mean_correlation_post_top10'],  # ← FIXED: was 'post10'
+                        'post_corr_top10': results['comparison']['mean_correlation_post_top10'],
                         'global_change_%': results['comparison']['global_correlation_change_percent'],
                         'top10_change_%': results['comparison']['top10_correlation_change_percent'],
+                        'pre_random_mean_corr': results['comparison']['pre_random_mean_correlation'],
+                        'post_random_mean_corr': results['comparison']['post_random_mean_correlation'],
                         'status': 'SUCCESS'
                     })
                                         
@@ -1367,94 +1601,41 @@ def batch_process_organoids_enhanced(base_folder):
             print(f"{'='*70}")
             
             try:
-                # Use first PRE recording
                 pre_path = pre_recs[0]
-                
-                # Load data for all recordings
-                print("Loading data for all recordings...")
-                
-                all_dff_list = []
-                all_spike_list = []
-                all_corr_stats_list = []
-                recording_labels = []
-                
-                # Load PRE
-                print(f"  Loading PRE...")
-                F_pre = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'F.npy'))
-                Fneu_pre = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'Fneu.npy'))
-                stat = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'stat.npy'), allow_pickle=True)
-                ops = np.load(os.path.join(pre_path, 'suite2p', 'plane0', 'ops.npy'), allow_pickle=True).item()
-                
-                # CONVERT TO FLOAT64
-                F_pre = F_pre.astype(np.float64)
-                Fneu_pre = Fneu_pre.astype(np.float64)
-                
-                # Get frame rate
-                pre_name = os.path.basename(pre_path)
-                xml_path = os.path.join(pre_path, f"{pre_name}.xml")
-                if os.path.exists(xml_path):
-                    try:
-                        xml_dict = files.read_xml(xml_path)
-                        frame_rate = 1 / xml_dict["rel_time"][1]
-                    except:
-                        frame_rate = 15.0
-                else:
-                    frame_rate = 15.0
-                
-                n_cells = F_pre.shape[0]
-                
-                # Process PRE
-                dff_pre = (F_pre - 0.7 * Fneu_pre) / (F_pre - 0.7 * Fneu_pre).mean(axis=1, keepdims=True)
-                _, spikes_pre = process_spike_data_gcamp6m(dff_pre, n_cells, F_pre.shape[1], sampling_rate=frame_rate)
-                
-                # Filter cells using PRE
-                print("\nFiltering cells based on PRE recording...")
-                stage1_mask, _ = basic_signal_quality_filter(dff_pre, spikes_pre, use_dff_for_filtering=False)
-                final_mask, _ = event_based_snr_filter(dff_pre, spikes_pre, stage1_mask, sampling_rate=frame_rate)
-                
+
+                print("Loading data for all recordings (cached -- reuses TYPE 1 results where possible)...")
+
+                pre_data = get_pre_recording_data(pre_path, recording_cache, organoid_name=organoid_name)
+
+                stat_filtered = pre_data['stat_filtered']
+                ops = pre_data['ops']
+                frame_rate = pre_data['frame_rate']
+                final_mask = pre_data['mask']
+                n_cells = pre_data['n_cells_original']
+
                 print(f"  Cells filtered: {np.sum(final_mask)}/{n_cells}")
-                
-                # Get sync cells from PRE
-                corr_pre, _, _, corr_pre_stats = calculate_cross_correlation_with_lags(spikes_pre[final_mask, :])
-                sync_cell_indices, sync_scores = identify_top_synchronous_cells(corr_pre, n_cells=10)
-                
-                # Apply filtering to PRE
-                dff_pre_filtered = dff_pre[final_mask, :]
-                spikes_pre_filtered = spikes_pre[final_mask, :]
-                stat_filtered = stat[final_mask]
-                
-                all_dff_list.append(dff_pre_filtered)
-                all_spike_list.append(spikes_pre_filtered)
-                all_corr_stats_list.append(corr_pre_stats)
-                recording_labels.append('PRE')
-                
-                # Load all POST recordings
+
+                sync_cell_indices, sync_scores = identify_top_synchronous_cells(
+                    pre_data['corr_max'], n_cells=10
+                )
+
+                all_dff_list = [pre_data['dff_filtered']]
+                all_spike_list = [pre_data['spikes_filtered']]
+                all_corr_stats_list = [pre_data['corr_stats']]
+                recording_labels = ['PRE']
+
                 for post_idx, post_path in enumerate(post_recs, 1):
                     print(f"  Loading POST-{post_idx:03d}...")
-                    
-                    F_post = np.load(os.path.join(post_path, 'suite2p', 'plane0', 'F.npy'))
-                    Fneu_post = np.load(os.path.join(post_path, 'suite2p', 'plane0', 'Fneu.npy'))
-                    
-                    # CONVERT TO FLOAT64
-                    F_post = F_post.astype(np.float64)
-                    Fneu_post = Fneu_post.astype(np.float64)
-                    
-                    dff_post = (F_post - 0.7 * Fneu_post) / (F_post - 0.7 * Fneu_post).mean(axis=1, keepdims=True)
-                    _, spikes_post = process_spike_data_gcamp6m(dff_post, n_cells, F_post.shape[1], sampling_rate=frame_rate)
-                    
-                    # Apply same filtering
-                    dff_post_filtered = dff_post[final_mask, :]
-                    spikes_post_filtered = spikes_post[final_mask, :]
-                    
-                    # Calculate correlation
-                    corr_post, _, _, corr_post_stats = calculate_cross_correlation_with_lags(spikes_post_filtered)
-                    
-                    all_dff_list.append(dff_post_filtered)
-                    all_spike_list.append(spikes_post_filtered)
-                    all_corr_stats_list.append(corr_post_stats)
+
+                    post_data = get_post_recording_data(
+                        post_path, pre_data, recording_cache, organoid_name=organoid_name
+                    )
+
+                    all_dff_list.append(post_data['dff_filtered'])
+                    all_spike_list.append(post_data['spikes_filtered'])
+                    all_corr_stats_list.append(post_data['corr_stats'])
                     recording_labels.append(f'POST-{post_idx:03d}')
-                
-                # Create mega-figure
+
                 print("\nCreating mega-figure...")
                 if 'meanImg' in ops:
                     avg_projection = ops['meanImg']
@@ -1466,7 +1647,6 @@ def batch_process_organoids_enhanced(base_folder):
                 mega_output_path = os.path.join(output_folder, 
                                                f"{organoid_name}_mega_figure_all_recordings.png")
                 
-                # UPDATED: Capture correlation metrics
                 fig, all_correlation_metrics = create_mega_figure_all_recordings(
                     all_dff_list,
                     all_spike_list,
@@ -1481,7 +1661,6 @@ def batch_process_organoids_enhanced(base_folder):
                 
                 print(f"✓ Mega-figure created successfully")
                 
-                # Save mega-figure statistics to CSV
                 print("\nSaving mega-figure statistics...")
                 mega_stats_list = []
                 for metric in all_correlation_metrics:
@@ -1502,7 +1681,6 @@ def batch_process_organoids_enhanced(base_folder):
                 mega_stats_df.to_csv(mega_stats_path, index=False)
                 print(f"✓ Saved mega-figure statistics to: {mega_stats_path}")
                 
-                # Save top 10 cell information
                 cell_info_list = []
                 original_indices = np.where(final_mask)[0]
                 original_sync_indices = original_indices[sync_cell_indices]
@@ -1558,7 +1736,6 @@ def batch_process_organoids_enhanced(base_folder):
             print(f"  Global change: {row['global_change_%']:+.1f}%")
             print(f"  Top10 change:  {row['top10_change_%']:+.1f}%")
     
-    # Save comprehensive batch summary
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_path = os.path.join(base_folder, 
                                f'batch_summary_{timestamp}.csv')
@@ -1570,14 +1747,17 @@ def batch_process_organoids_enhanced(base_folder):
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
-if __name__ == "__main__":
-    
-    BASE_FOLDER = r'Z:\from_jasmine\3x\B4_D120_3x'
-    
+def run_full_pipeline(base_folder):
+    """
+    Run STEP 0 (deconcat) + the main analysis pipeline for a single
+    base_folder. Called once per entry in BASE_FOLDERS below.
+    """
+
     print("="*80)
     print("ENHANCED ORGANOID PRE/POST GABAZINE ANALYSIS")
+    print(f"Base folder: {base_folder}")
     print("="*80)
-    
+
     # ========================================================================
     # STEP 0: DECONCAT (if needed)
     # ========================================================================
@@ -1585,12 +1765,11 @@ if __name__ == "__main__":
     print("STEP 0: CHECKING FOR CONCATENATED SUITE2P DATA")
     print("="*80)
     print("\nScanning for organoid folders that need deconcatenation...")
-    
-    all_files = os.listdir(BASE_FOLDER)
+
+    all_files = os.listdir(base_folder)
     for recording in all_files:
-        recording_folder = os.path.join(BASE_FOLDER, recording)
+        recording_folder = os.path.join(base_folder, recording)
         if os.path.isdir(recording_folder):
-            # Check if this folder has a main suite2p folder (indicating concatenated data)
             main_suite2p = os.path.join(recording_folder, 'suite2p', 'plane0')
             
             if os.path.exists(main_suite2p):
@@ -1598,7 +1777,6 @@ if __name__ == "__main__":
                 print(f"Found concatenated suite2p data in: {recording}")
                 print(f"{'='*70}")
                 
-                # Check if subfolders already have suite2p data (already deconcat'd)
                 subfolders = [f for f in os.listdir(recording_folder) 
                              if os.path.isdir(os.path.join(recording_folder, f)) 
                              and f != 'suite2p' and 'analysis' not in f.lower()]
@@ -1620,6 +1798,10 @@ if __name__ == "__main__":
                         if frame_info is not None:
                             cumulative_frames = deconcat_suite2p_output(frame_info, recording_folder)
                             print(f"  ✓ Deconcat complete for {recording}")
+                        else:
+                            print(f"  → No per-trial XML subfolders -- falling back to equal PRE/POST split")
+                            split_combined_suite2p_equal_pre_post(recording_folder, recording)
+                            print(f"  ✓ Equal-split deconcat complete for {recording}")
                     except Exception as e:
                         print(f"  ❌ ERROR during deconcat: {e}")
                         import traceback
@@ -1641,9 +1823,35 @@ if __name__ == "__main__":
     print("     - TYPE 2: Mega-figure with all recordings side-by-side")
     print("="*80)
     
-    summary_df = batch_process_organoids_enhanced(base_folder=BASE_FOLDER)
-    
+    summary_df = batch_process_organoids_enhanced(base_folder=base_folder)
+
     if summary_df is not None:
         print("\n" + "="*80)
-        print("ALL DONE!")
+        print(f"ALL DONE! ({base_folder})")
         print("="*80)
+
+    return summary_df
+
+
+if __name__ == "__main__":
+
+    BASE_FOLDERS = [
+        r'Z:\from_jasmine\3x\Negatives',
+    ]
+
+    all_summaries = {}
+    for base_folder in BASE_FOLDERS:
+        try:
+            all_summaries[base_folder] = run_full_pipeline(base_folder)
+        except Exception as e:
+            print(f"\n❌ ERROR processing base folder {base_folder}: {e}")
+            import traceback
+            traceback.print_exc()
+            all_summaries[base_folder] = None
+
+    print("\n" + "="*80)
+    print("ALL BASE FOLDERS COMPLETE")
+    print("="*80)
+    for base_folder, summary_df in all_summaries.items():
+        status = f"{len(summary_df)} comparisons" if summary_df is not None else "FAILED / no results"
+        print(f"  {base_folder}: {status}")

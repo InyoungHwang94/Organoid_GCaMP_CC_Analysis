@@ -2,13 +2,15 @@
 ===============================================================================
 CalculateCC.py — Correlation Coefficient Analysis of Organoid Calcium Imaging
 Created : 2026-03-24
-Last Modified : 2026-03-24
+Last Modified : 2026-07-20
 
 Purpose
 -------
 Main analysis pipeline: loads Suite2p output, applies two-stage ROI quality
-filtering, computes pairwise cross-correlation matrices with temporal lags,
-and detects population-level synchrony events. Results saved to .h5 per recording.
+filtering, computes pairwise cross-correlation matrices with temporal lags
+(vectorized), estimates a shuffled chance-level baseline, and detects
+population-level synchrony events. Results saved to .h5 per recording, with
+a running per-recording correlation summary CSV
 
 Pipeline Position
 -----------------
@@ -22,6 +24,11 @@ Notes
   if no .xml file is found.
 - Set ENABLE_FILTERING = False to skip the two-stage ROI quality filter.
 - Output folders are recreated on each run (existing data will be overwritten).
+- Cross-correlation is now vectorized (matrix ops across all lags at once)
+  instead of looping per cell pair.
+- Added calculate_shuffled_cross_correlation_baseline() for a chance-level
+  control: circularly shifts each cell independently and recomputes mean max
+  cross-correlation, repeated n_shuffles times.
 
 ===============================================================================
 """
@@ -380,110 +387,108 @@ def preprocessing_pipeline(data,
     return processed_data, active_mask, preprocessing_stats
 
 # ============================================================================
-# SECTION 3: CROSS-CORRELATION WITH TIME LAGS
+# SECTION 3: CROSS-CORRELATION WITH TIME LAGS (VECTORIZED)
 # ============================================================================
 
-def calculate_cross_correlation_with_lags(data, max_lag=3):
+def calculate_cross_correlation_with_lags(data, max_lag=3, verbose=True):
     """
-    Calculate cross-correlation with time lags for all cell pairs
-    
+    Calculate cross-correlation with time lags for all cell pairs (vectorized
+    across pairs and lags via matrix operations).
+
     Parameters:
         data: (n_cells, n_frames) array of preprocessed neural data
         max_lag: maximum time lag in frames (default: 3 frames = ±200ms at 15Hz)
-    
+        verbose: print progress and summary (set False for repeated/shuffle calls)
+
     Returns:
         max_corr_matrix: (n_cells, n_cells) matrix of maximum correlations
         best_lag_matrix: (n_cells, n_cells) matrix of optimal lags
         standard_corr_matrix: (n_cells, n_cells) standard correlation at lag=0
         correlation_stats: dictionary with statistics
     """
-    
+
     n_cells, n_frames = data.shape
-    
-    print(f"\n{'='*80}")
-    print(f"CROSS-CORRELATION ANALYSIS")
-    print(f"{'='*80}")
-    
+
+    if verbose:
+        print(f"\n{'='*80}")
+        print(f"CROSS-CORRELATION ANALYSIS")
+        print(f"{'='*80}")
+
     # Initialize output matrices
     max_corr_matrix = np.zeros((n_cells, n_cells))
     best_lag_matrix = np.zeros((n_cells, n_cells), dtype=int)
     standard_corr_matrix = np.zeros((n_cells, n_cells))
-    
+
     # Remove cells with no variance
     valid_cells = []
     for i in range(n_cells):
         if np.var(data[i, :]) > 1e-10:
             valid_cells.append(i)
-    
-    print(f"Using {len(valid_cells)}/{n_cells} cells with sufficient variance")
-    
+
+    if verbose:
+        print(f"Using {len(valid_cells)}/{n_cells} cells with sufficient variance")
+
     if len(valid_cells) < 2:
-        print("ERROR: Too few cells with variance")
+        if verbose:
+            print("ERROR: Too few cells with variance")
         return max_corr_matrix, best_lag_matrix, standard_corr_matrix, {}
-    
-    # Calculate correlations with progress bar
-    print("\nCalculating cross-correlations...")
-    
-    total_pairs = len(valid_cells) * (len(valid_cells) - 1) // 2
-    pbar = tqdm(total=total_pairs, desc="Cell pairs processed")
-    
-    for idx_i, cell_i in enumerate(valid_cells):
-        for idx_j, cell_j in enumerate(valid_cells):
-            if idx_j <= idx_i:
-                continue  # Only calculate upper triangle
-            
-            signal_i = data[cell_i, :]
-            signal_j = data[cell_j, :]
-            
-            # Normalize signals (z-score)
-            signal_i_norm = (signal_i - np.mean(signal_i)) / (np.std(signal_i) + 1e-10)
-            signal_j_norm = (signal_j - np.mean(signal_j)) / (np.std(signal_j) + 1e-10)
-            
-            # Calculate correlations at different lags
-            correlations = []
-            lags = range(-max_lag, max_lag + 1)
-            
-            for lag in lags:
-                if lag < 0:
-                    # Negative lag: shift signal_j backward (signal_i leads)
-                    overlap_i = signal_i_norm[:lag]
-                    overlap_j = signal_j_norm[-lag:]
-                elif lag > 0:
-                    # Positive lag: shift signal_j forward (signal_j leads)
-                    overlap_i = signal_i_norm[lag:]
-                    overlap_j = signal_j_norm[:-lag]
-                else:
-                    # No lag
-                    overlap_i = signal_i_norm
-                    overlap_j = signal_j_norm
-                
-                # Calculate Pearson correlation on overlapping region
-                if len(overlap_i) > 10:  # Need sufficient overlap
-                    corr = np.corrcoef(overlap_i, overlap_j)[0, 1]
-                    correlations.append(corr if not np.isnan(corr) else 0.0)
-                else:
-                    correlations.append(0.0)
-            
-            # Find maximum correlation and corresponding lag
-            correlations = np.array(correlations)
-            max_corr_idx = np.argmax(correlations)
-            max_corr = correlations[max_corr_idx]
-            best_lag = list(lags)[max_corr_idx]
-            
-            # Store results (symmetric matrix)
-            max_corr_matrix[cell_i, cell_j] = max_corr
-            max_corr_matrix[cell_j, cell_i] = max_corr
-            
-            best_lag_matrix[cell_i, cell_j] = best_lag
-            best_lag_matrix[cell_j, cell_i] = -best_lag  # Opposite lag for reverse direction
-            
-            # Store standard correlation (lag=0) for comparison
-            standard_corr_matrix[cell_i, cell_j] = correlations[max_lag]  # Center of lag range
-            standard_corr_matrix[cell_j, cell_i] = correlations[max_lag]
-            
-            pbar.update(1)
-    
-    pbar.close()
+
+    # Calculate correlations for all cell pairs at once (vectorized across pairs and lags)
+    if verbose:
+        print("\nCalculating cross-correlations (vectorized)...")
+
+    valid_idx = np.array(valid_cells)
+    valid_data = data[valid_idx, :]
+    means = valid_data.mean(axis=1, keepdims=True)
+    stds = valid_data.std(axis=1, keepdims=True)
+    norm_data = (valid_data - means) / (stds + 1e-10)
+
+    lags = list(range(-max_lag, max_lag + 1))
+    n_valid = len(valid_idx)
+    all_corrs = np.zeros((len(lags), n_valid, n_valid))
+
+    for li, lag in enumerate(lags):
+        if lag < 0:
+            A = norm_data[:, :lag]
+            B = norm_data[:, -lag:]
+        elif lag > 0:
+            A = norm_data[:, lag:]
+            B = norm_data[:, :-lag]
+        else:
+            A = norm_data
+            B = norm_data
+
+        if A.shape[1] <= 10:  # Need sufficient overlap
+            continue
+
+        Ac = A - A.mean(axis=1, keepdims=True)
+        Bc = B - B.mean(axis=1, keepdims=True)
+        norm_A = np.sqrt((Ac ** 2).sum(axis=1))
+        norm_B = np.sqrt((Bc ** 2).sum(axis=1))
+        denom = np.outer(norm_A, norm_B)
+
+        with np.errstate(invalid="ignore", divide="ignore"):
+            corr = (Ac @ Bc.T) / denom
+        corr[denom == 0] = 0.0
+        all_corrs[li] = np.nan_to_num(corr, nan=0.0)
+
+    max_corr_vals = np.max(all_corrs, axis=0)
+    best_lag_idx = np.argmax(all_corrs, axis=0)
+    lags_arr = np.array(lags)
+    best_lag_vals = lags_arr[best_lag_idx]
+    standard_corr_vals = all_corrs[max_lag]  # lag == 0 slice (center of lag range)
+
+    iu, ju = np.triu_indices(n_valid, k=1)
+    gi, gj = valid_idx[iu], valid_idx[ju]
+
+    max_corr_matrix[gi, gj] = max_corr_vals[iu, ju]
+    max_corr_matrix[gj, gi] = max_corr_vals[iu, ju]
+
+    best_lag_matrix[gi, gj] = best_lag_vals[iu, ju]
+    best_lag_matrix[gj, gi] = -best_lag_vals[iu, ju]  # Opposite lag for reverse direction
+
+    standard_corr_matrix[gi, gj] = standard_corr_vals[iu, ju]
+    standard_corr_matrix[gj, gi] = standard_corr_vals[iu, ju]
     
     # Set diagonal to 1.0
     np.fill_diagonal(max_corr_matrix, 1.0)
@@ -530,11 +535,63 @@ def calculate_cross_correlation_with_lags(data, max_lag=3):
         'percent_positive_corr': np.sum(valid_max_corr > 0.1) / len(valid_max_corr) * 100 if len(valid_max_corr) > 0 else 0
     }
     
-    print(f"\nCross-correlation results:")
-    print(f"  Max correlation - Mean: {correlation_stats['mean_max_correlation']:.3f}, "
-          f"Median: {correlation_stats['median_max_correlation']:.3f}")
-    
+    if verbose:
+        print(f"\nCross-correlation results:")
+        print(f"  Max correlation - Mean: {correlation_stats['mean_max_correlation']:.3f}, "
+              f"Median: {correlation_stats['median_max_correlation']:.3f}")
+
     return max_corr_matrix, best_lag_matrix, standard_corr_matrix, correlation_stats
+
+
+def calculate_shuffled_cross_correlation_baseline(data, max_lag=3, n_shuffles=100, verbose=True):
+    """
+    Estimate the chance-level cross-correlation by independently circularly
+    shifting each cell's trace and recomputing the mean max cross-correlation,
+    repeated n_shuffles times.
+
+    Parameters:
+        data: (n_cells, n_frames) array of preprocessed neural data
+        max_lag: maximum time lag in frames (same value used for the real correlation)
+        n_shuffles: number of circular-shift iterations
+        verbose: print progress and summary
+
+    Returns:
+        shuffle_stats: dict with 'mean_random_max_correlation', 'std_random_max_correlation',
+            and 'shuffle_mean_max_correlations' (the per-iteration values)
+    """
+
+    n_cells, n_frames = data.shape
+    shuffle_mean_max_correlations = np.zeros(n_shuffles)
+
+    if verbose:
+        print(f"\nComputing shuffled (chance) cross-correlation baseline ({n_shuffles} iterations)...")
+
+    for s in tqdm(range(n_shuffles), desc="Shuffle iterations", disable=not verbose):
+        shuffled_data = np.zeros_like(data)
+        for i in range(n_cells):
+            shift = np.random.randint(0, n_frames)
+            shuffled_data[i] = np.roll(data[i], shift)
+
+        _, _, _, shuffled_corr_stats = calculate_cross_correlation_with_lags(
+            shuffled_data, max_lag=max_lag, verbose=False
+        )
+        shuffle_mean_max_correlations[s] = shuffled_corr_stats.get('mean_max_correlation', 0)
+
+    mean_random_max_correlation = float(np.mean(shuffle_mean_max_correlations))
+    std_random_max_correlation = float(np.std(shuffle_mean_max_correlations))
+
+    if verbose:
+        print(f"  Random (chance) mean max correlation: "
+              f"{mean_random_max_correlation:.3f} ± {std_random_max_correlation:.3f}")
+
+    shuffle_stats = {
+        'mean_random_max_correlation': mean_random_max_correlation,
+        'std_random_max_correlation': std_random_max_correlation,
+        'shuffle_mean_max_correlations': shuffle_mean_max_correlations,
+        'n_shuffles': n_shuffles
+    }
+
+    return shuffle_stats
 
 # ============================================================================
 # SECTION 4: ROBUST SPIKE DETECTION
@@ -663,7 +720,7 @@ def find_transient_boundaries(trace, peak_frame, baseline_median, mad, threshold
     
     Parameters:
             trace: detrended and smoothed calcium signal
-            peak_frame: detected peak location (frame index)  # ← FIX THIS
+            peak_frame: detected peak location (frame index)
             baseline_median: baseline level of the trace
             mad: median absolute deviation (noise level)
             threshold_factor: multiplier for threshold (default 1.0)
@@ -1075,11 +1132,6 @@ def save_population_synchrony_to_csv(
 #   Mean inter-event interval: {event_stats.get('mean_interval_s', 'N/A')} s
 # """
     
-#     if 'z_score' in sync_stats:
-#         metadata += f"""#   Shuffle baseline: {sync_stats['shuffle_mean_percent']:.2f} ± {sync_stats['shuffle_std_percent']:.2f}%
-# #   Z-score: {sync_stats['z_score']:.2f}
-# """
-    
     metadata += "#\n# Column descriptions:\n"
     metadata += "#   event_id: Sequential event number\n"
     metadata += "#   start_frame: First frame of synchronous event\n"
@@ -1122,7 +1174,7 @@ def save_population_synchrony_to_csv(
 
 def plot_filtering_results(dff_data, spike_data, stage1_mask, stage2_mask, 
                            stage1_stats, stage2_stats, rec_name, save_path):
-    """Create filtering visualization plots - FIXED RASTER SCALE"""
+    """Create filtering visualization plots"""
     
     n_cells = len(stage1_mask)
     n_stage1 = np.sum(stage1_mask)
@@ -1180,7 +1232,7 @@ def plot_filtering_results(dff_data, spike_data, stage1_mask, stage2_mask,
 
 def plot_raster_exclusion_analysis(dff_data, spike_data, stage1_mask, final_mask, 
                                    stage1_stats, stage2_stats, rec_name, save_path):
-    """Create raster plots showing what was excluded at each stage - FIXED SCALE"""
+    """Create raster plots showing what was excluded at each stage"""
     
     n_cells = len(stage1_mask)
     stage1_excluded = ~stage1_mask
@@ -1254,31 +1306,37 @@ def create_final_summary_with_synchrony(
     dff_corr_stats, spike_corr_stats,
     event_data, event_stats,
     dff_processed, spikes_processed, n_original_cells,
-    final_mask, rec_name, save_path):
-    
+    final_mask, rec_name, save_path,
+    dff_random_mean_corr=None, spike_random_mean_corr=None):
+
     """Create final summary plot with cross-correlation and synchrony results"""
-    
+
     fig, axes = plt.subplots(1,3, figsize=(12, 4))
-    
+
     # DFF max cross-correlations
-    im1 = axes[0].imshow(dff_max_corr, aspect='auto', cmap='Reds', 
+    im1 = axes[0].imshow(dff_max_corr, aspect='auto', cmap='Reds',
                           interpolation='nearest', vmin=0, vmax=1)
     plt.colorbar(im1, ax=axes[0], label='Correlation')
-    axes[0].set_title(f'DFF Max Cross-Correlation\nMean: {dff_corr_stats["mean_max_correlation"]:.3f} ')
+    dff_random_text = f" | Random: {dff_random_mean_corr:.3f}" if dff_random_mean_corr is not None else ""
+    axes[0].set_title(f'DFF Max Cross-Correlation\nMean: {dff_corr_stats["mean_max_correlation"]:.3f}{dff_random_text}')
     axes[0].set_xlabel('Cells')
     axes[0].set_ylabel('Cells')
-    
+
     # Spike max cross-correlations
-    im2 = axes[1].imshow(spike_max_corr, aspect='auto', cmap='Reds', 
+    im2 = axes[1].imshow(spike_max_corr, aspect='auto', cmap='Reds',
                           interpolation='nearest', vmin=0, vmax=1)
     plt.colorbar(im2, ax=axes[1], label='Correlation')
-    axes[1].set_title(f'Spike Max Cross-Correlation\nMean: {spike_corr_stats["mean_max_correlation"]:.3f} ')
+    spike_random_text = f" | Random: {spike_random_mean_corr:.3f}" if spike_random_mean_corr is not None else ""
+    axes[1].set_title(f'Spike Max Cross-Correlation\nMean: {spike_corr_stats["mean_max_correlation"]:.3f}{spike_random_text}')
     axes[1].set_xlabel('Cells')
     axes[1].set_ylabel('Cells')
-    
+
     # Summary statistics
     axes[2].axis('off')
-    
+
+    dff_random_line = f"- DFF random (chance) mean: {dff_random_mean_corr:.3f}\n" if dff_random_mean_corr is not None else ""
+    spike_random_line = f"- Spike random (chance) mean: {spike_random_mean_corr:.3f}\n" if spike_random_mean_corr is not None else ""
+
     summary_text = f"""
 Processing Summary - {rec_name}
 
@@ -1286,9 +1344,9 @@ Original cells: {n_original_cells}
 Filtered cells: {dff_processed.shape[0]} ({np.sum(final_mask)/n_original_cells*100:.1f}%)
 
 Cross-Correlation Results:
-- DFF mean: {dff_corr_stats['mean_max_correlation']:.3f} 
+- DFF mean: {dff_corr_stats['mean_max_correlation']:.3f}
 - Spike mean: {spike_corr_stats['mean_max_correlation']:.3f}
-
+{dff_random_line}{spike_random_line}
 Population Synchrony:
 - Events detected: {len(event_data)}
 """
@@ -1343,6 +1401,7 @@ def convert_tuples_to_lists(obj):
 folder_path = r'E:\HERE_SOOBINA\B3\B3_D150_GC'
 subfolders = [f.path for f in os.scandir(folder_path) if f.is_dir()]
 num_subfolders = len(subfolders)
+summary_csv_path = os.path.join(folder_path, 'correlation_summary.csv')
 
 ENABLE_FILTERING = True
 
@@ -1383,7 +1442,7 @@ cross_correlation_params = {
 
 # Population synchrony parameters
 synchrony_params = {
-    'min_fraction_coincident': 0.10,  # 5% of cells
+    'min_fraction_coincident': 0.10,  # 10% of cells
     'compute_shuffle_baseline': True,
     'n_shuffles': 100
 }
@@ -1593,7 +1652,34 @@ for subfolder in tqdm(subfolders):
         print(f"  Spike max mean: {spikes_correlation_stats['mean_max_correlation']:.3f} "
               f"(standard: {spikes_correlation_stats['mean_standard_correlation']:.3f}, "
               f"+{spikes_correlation_stats['improvement_percentage']:.1f}%)")
-        
+
+        # Shuffled (chance) cross-correlation baseline: circularly shift each
+        # cell's trace by an independent random amount and recompute the mean
+        # max cross-correlation, repeated 1000 times. No subtraction applied yet.
+        print("\nCalculating DFF shuffled (chance) cross-correlation baseline...")
+        DFF_shuffle_stats = calculate_shuffled_cross_correlation_baseline(
+            DFF_for_correlation,
+            max_lag=cross_correlation_params['max_lag'],
+            n_shuffles=1000
+        )
+
+        print("\nCalculating spike shuffled (chance) cross-correlation baseline...")
+        spikes_shuffle_stats = calculate_shuffled_cross_correlation_baseline(
+            spikes_for_correlation,
+            max_lag=cross_correlation_params['max_lag'],
+            n_shuffles=1000
+        )
+
+        # Append per-recording correlation summary to CSV
+        summary_row = pd.DataFrame([{
+            'rec_name': rec_name,
+            'dff_max_corr': DFF_correlation_stats['mean_max_correlation'],
+            'spikes_max_corr': spikes_correlation_stats['mean_max_correlation'],
+            'dff_random_mean_corr': DFF_shuffle_stats['mean_random_max_correlation'],
+            'spike_random_mean_corr': spikes_shuffle_stats['mean_random_max_correlation']
+        }])
+        summary_row.to_csv(summary_csv_path, mode='a', header=not os.path.exists(summary_csv_path), index=False)
+
         # ========================================
         # POPULATION-LEVEL SYNCHRONY ANALYSIS
         # ========================================
@@ -1729,6 +1815,11 @@ for subfolder in tqdm(subfolders):
                 'correlation_method': 'cross_correlation_with_time_lags',
                 'cells_used_for_correlation': DFF_for_correlation.shape[0]
             },
+            'shuffled_baseline_analysis': {
+                'dff_shuffle_stats': DFF_shuffle_stats,
+                'spikes_shuffle_stats': spikes_shuffle_stats,
+                'n_shuffles': 1000
+            },
             'population_synchrony_analysis': synchrony_results,
             'processed_data': {
                 'dff_processed': DFF_for_correlation,
@@ -1774,7 +1865,9 @@ for subfolder in tqdm(subfolders):
                 DFF_correlation_stats, spikes_correlation_stats,
                 event_data, event_stats,
                 DFF_for_correlation, spikes_for_correlation, n_cells,
-                final_mask, rec_name, output_folder
+                final_mask, rec_name, output_folder,
+                dff_random_mean_corr=DFF_shuffle_stats['mean_random_max_correlation'],
+                spike_random_mean_corr=spikes_shuffle_stats['mean_random_max_correlation']
             )
         except Exception as e:
             print(f"ERROR: Final summary plot creation failed: {e}")
@@ -1789,6 +1882,8 @@ for subfolder in tqdm(subfolders):
         print(f"\nKey Results:")
         print(f"  DFF correlation: {DFF_correlation_stats['mean_max_correlation']:.3f}")
         print(f"  Spike correlation: {spikes_correlation_stats['mean_max_correlation']:.3f}")
+        print(f"  DFF random baseline: {DFF_shuffle_stats['mean_random_max_correlation']:.3f}")
+        print(f"  Spike random baseline: {spikes_shuffle_stats['mean_random_max_correlation']:.3f}")
         if len(event_data) > 0:
             print(f"  Population synchrony events: {len(event_data)}")
             print(f"  Mean event duration: {event_stats['mean_duration_ms']:.0f} ms")
